@@ -1,22 +1,19 @@
-import { useState } from 'react';
 
 export type sport = 'running' | 'riding'
 
 interface SportSelectProps {
-    propagateSport: (sport: sport) => void,
-    defaultSport: sport
+    setSport: (sport: sport) => void,
+    sport: sport
 }
 
-function SportSelect({ propagateSport, defaultSport }: SportSelectProps) {
-    const [selectedOption, setSelectedOption] = useState<sport>(defaultSport);
+function SportSelect({ setSport, sport }: SportSelectProps) {
 
     return (
         <div>
             <h2>Select a Sport</h2>
-            <select value={selectedOption} onChange={(event) => {
+            <select value={sport} onChange={(event) => {
                 const sport = event.currentTarget.value as sport;
-                setSelectedOption(sport);
-                propagateSport(sport);
+                setSport(sport);
             }
             }>
                 <option value="riding">Bike</option>

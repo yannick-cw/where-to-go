@@ -1,7 +1,8 @@
 import { decode } from 'google-polyline';
-import mapboxgl, { GeoJSONSourceRaw, LngLat } from 'mapbox-gl'; // eslint-disable-line import/no-webpack-loader-syntax
+import mapboxgl, { GeoJSONSourceRaw, LngLat, MercatorCoordinate } from 'mapbox-gl'; // eslint-disable-line import/no-webpack-loader-syntax
 import 'mapbox-gl/dist/mapbox-gl.css';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { tileToGeoJSON } from '@mapbox/tilebelt';
+import { useEffect, useRef, useState } from 'react';
 import SportSelect, { sport } from './SportSelect';
 // @ts-ignore
 import { VectorTile } from '@mapbox/vector-tile';
@@ -25,8 +26,10 @@ function App() {
   const [zoom, setZoom] = useState(defaultZoom);
   const [topSegments, setTopSegments] = useState<TopSegments>({ topSegments: [], athleteCount: 0, starCount: 0 })
   const [trailViewGeo, setTrailViewGeo] = useState<GeoJSON.Feature<GeoJSON.Geometry>[]>([])
+  const [stravaHeatmaps, setStravaHeatmaps] = useState<StravaHeatmap[]>([])
+  const [mapLoaded, setMapLoaded] = useState(false);
 
-  const fetchOverlayData = useCallback(() => {
+  const fetchOverlayData = (() => {
     const m = map.current
     if (m && !isSending) {
       setSending(true)
@@ -38,7 +41,14 @@ function App() {
           .then(geoms => setTrailViewGeo(geoms.flat()))
       ]).finally(() => setSending(false))
     }
-  }, [isSending])
+  })
+
+  useEffect(() => {
+    const m = map.current
+    if (m) {
+      setStravaHeatmaps(getStravaHeatmaps(zoom, m.getBounds().getNorthWest(), m.getBounds().getSouthEast(), currentSport))
+    }
+  }, [zoom])
 
   useEffect(() => {
     const m = map.current
@@ -58,6 +68,16 @@ function App() {
   }, [trailViewGeo])
 
   useEffect(() => {
+    const m = map.current
+    if (m && stravaHeatmaps.length > 0 && mapLoaded) addStravaHeatmaps(stravaHeatmaps, m);
+    return () => {
+      if (m && stravaHeatmaps.length > 0 && mapLoaded) {
+        deleteStravaHeatmap(m, stravaHeatmaps);
+      }
+    }
+  }, [stravaHeatmaps, mapLoaded])
+
+  useEffect(() => {
     if (map.current) return;
     else {
       map.current = new mapboxgl.Map({
@@ -67,15 +87,22 @@ function App() {
         zoom: defaultZoom
       });
 
-
-      map.current.on('move', () => {
-        setZoom(Math.floor(map.current?.getZoom() || defaultZoom));
+      map.current.on('load', () => {
+        setMapLoaded(true);
       });
     }
-  })
+  }, [zoom])
+
+  useEffect(() => {
+    map.current?.on('move', () => {
+      const z = map.current ? Math.floor(map.current?.getZoom()) : defaultZoom;
+      setZoom(z);
+    });
+  }, [zoom])
+
   return (
     <div>
-      <SportSelect propagateSport={setSport} defaultSport={defaultSport}></SportSelect>
+      <SportSelect setSport={setSport} sport={currentSport}></SportSelect>
       <div ref={mapContainer} className="map-container" />
       <button className="load-button" disabled={isSending} onClick={fetchOverlayData}>Show places to visit</button>
       <div>{zoom}</div>
@@ -112,7 +139,7 @@ function addSegments(segments: Segment[], map: mapboxgl.Map): void {
         'line-cap': 'round',
       },
       paint: {
-        'line-color': (i == segments.length - 1) ? '#0fe400' : '#0074e4',
+        'line-color': (i === segments.length - 1) ? '#0fe400' : '#0074e4',
         'line-width': 5,
       },
     });
@@ -129,6 +156,27 @@ function addSegments(segments: Segment[], map: mapboxgl.Map): void {
   });
 }
 
+function addStravaHeatmaps(heatmaps: StravaHeatmap[], map: mapboxgl.Map): void {
+  heatmaps.forEach(heatmap => {
+
+    map.addSource("overlay-image-source" + heatmap.img, {
+      type: "image",
+      url: heatmap.img,
+      coordinates: heatmap.polygon.coordinates[0].reverse().slice(0, 4)
+    });
+
+    map.addLayer({
+      id: "overlay-image-layer" + heatmap.img,
+      type: "raster",
+      source: "overlay-image-source" + heatmap.img,
+      paint: {
+        "raster-opacity": 0.7,
+      }
+    })
+
+
+  })
+}
 function addKomootTrailview(trailviews: GeoJSON.Feature<GeoJSON.Geometry>[], map: mapboxgl.Map): void {
 
   map.addLayer({
@@ -218,6 +266,14 @@ function deleteHeatMap(map: mapboxgl.Map): void {
   map.removeSource(id);
 }
 
+function deleteStravaHeatmap(map: mapboxgl.Map, stravaHeatmaps: StravaHeatmap[]): void {
+  stravaHeatmaps.forEach(heatmap => {
+    map.removeLayer("overlay-image-layer" + heatmap.img,);
+    map.removeSource("overlay-image-source" + heatmap.img)
+  })
+}
+
+
 function deleteTrailViews(map: mapboxgl.Map): void {
   const id = 'point-layer'
   map.removeLayer(id);
@@ -277,15 +333,8 @@ function fetchTopSegmentCount(recData: TopSegments): Promise<TopSegments> {
   else return Promise.resolve(recData);
 }
 
-function getKomootHighlights(z: number, nW: LngLat, sE: LngLat): Promise<GeoJSON.Feature<GeoJSON.Geometry>[]> {
-
-  //protection for komoot, do not fetch tooo many tiles
-  if (z < 7) return Promise.resolve([]);
-
-  // zoom min 9
-  // no max, but can be empty
-  const zoom = Math.max(z, 9)
-  const tileCount = Math.pow(2, zoom); // Number of tiles in one dimension at this zoom level
+function calcAllVisibleTiles(z: number, nW: LngLat, sE: LngLat): [number, number][] {
+  const tileCount = Math.pow(2, z); // Number of tiles in one dimension at this zoom level
 
   // Calculate tile coordinates
   const nWXTile = Math.floor((nW.lng + 180) / 360 * tileCount);
@@ -301,9 +350,38 @@ function getKomootHighlights(z: number, nW: LngLat, sE: LngLat): Promise<GeoJSON
       xYPairs.push([x, y])
     }
   }
+  return xYPairs;
+}
+function getKomootHighlights(z: number, nW: LngLat, sE: LngLat): Promise<GeoJSON.Feature<GeoJSON.Geometry>[]> {
+  //protection for komoot, do not fetch tooo many tiles
+  if (z < 7) return Promise.resolve([]);
 
+  // zoom min 9 for komoot
+  // no max, but can be empty
+  const zoom = Math.max(z, 9)
+
+  const xYPairs = calcAllVisibleTiles(zoom, nW, sE)
   const results = Promise.all(xYPairs.map(([x, y]) => fetchOneTile(zoom, x, y))).then(a => a.flat());
   return results;
+}
+
+interface StravaHeatmap {
+  polygon: GeoJSON.Polygon,
+  img: string
+}
+function getStravaHeatmaps(z: number, nW: LngLat, sE: LngLat, sport: sport): StravaHeatmap[] {
+  const maxZoom = Math.min(10, z)
+  const xYPairs = calcAllVisibleTiles(maxZoom, nW, sE)
+  const results = xYPairs.map(([x, y]) => fetchOneTileHeatmap(maxZoom, x, y, sport));
+  return results;
+}
+
+function fetchOneTileHeatmap(zoom: number, xTile: number, yTile: number, sport: sport): StravaHeatmap {
+
+  const mappedSport = sport === "riding" ? "ride" : "run";
+  const url = `http://localhost:8000/tiles/${mappedSport}/blue/${zoom}/${xTile}/${yTile}@2x.png?v=19`
+
+  return { polygon: tileToGeoJSON([xTile, yTile, zoom]), img: url };
 }
 
 function fetchOneTile(zoom: number, xTile: number, yTile: number): Promise<GeoJSON.Feature<GeoJSON.Geometry>[]> {
